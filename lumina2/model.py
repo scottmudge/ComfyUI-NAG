@@ -1,6 +1,7 @@
 from functools import partial
 from types import MethodType
 import torch
+import torch.nn.functional as F
 import comfy.patcher_extension
 from comfy.ldm.lumina.model import NextDiT, JointAttention
 from ..utils import check_nag_activation, NAGSwitch, cat_context
@@ -33,7 +34,7 @@ class NAGNextDiT(NextDiT):
             transformer_options["nag_img_token_len"] = img_token_len
 
             # 2. Prepare Inputs
-            context = cat_context(context, nag_negative_context)
+            # Double the image input
             x = torch.cat([x, x], dim=0)
 
             if timesteps is not None:
@@ -41,10 +42,46 @@ class NAGNextDiT(NextDiT):
             if attention_mask is not None:
                 attention_mask = torch.cat([attention_mask, attention_mask], dim=0)
 
+            # Handle Context Doubling manually
+            if isinstance(context, torch.Tensor):
+                # Create a copy for the second half (the NAG reference path)
+                nag_ctx_half = context.clone()
+                
+                if nag_negative_context is not None:
+                    # Ensure dimensions match for assignment
+                    if nag_negative_context.dim() == 2:
+                        nag_cond = nag_negative_context.unsqueeze(0)
+                    else:
+                        nag_cond = nag_negative_context
+                    
+                    # --- Fix: Resize NAG Context to match Main Context Length ---
+                    target_len = nag_ctx_half.shape[1]
+                    current_len = nag_cond.shape[1]
+
+                    if current_len != target_len:
+                        if current_len > target_len:
+                            # Crop if too long
+                            nag_cond = nag_cond[:, :target_len, :]
+                        else:
+                            # Pad with zeros if too short
+                            pad_amount = target_len - current_len
+                            # F.pad for 3D tensor [B, Seq, Dim]: (pad_last_dim_L, R, pad_seq_L, R)
+                            nag_cond = F.pad(nag_cond, (0, 0, 0, pad_amount))
+
+                    # Inject the negative context
+                    # ComfyUI batches are typically [Cond, Uncond].
+                    # We want the NAG batch to be [Cond, NAG_Uncond].
+                    if nag_ctx_half.shape[0] > 1:
+                        nag_ctx_half[1] = nag_cond[0]
+                    else:
+                        # Fallback for single batch
+                        nag_ctx_half[0] = nag_cond[0]
+
+                context = torch.cat([context, nag_ctx_half], dim=0)
+
             # 3. Patch Modules safely
             for name, module in self.named_modules():
                 # Check for 'qkv' attribute to ensure we only patch actual Attention layers
-                # and strictly exclude the rope_embedder or other false positives.
                 if isinstance(module, JointAttention) and hasattr(module, "qkv"):
                     attention_forwards.append((module, module.forward))
                     module.forward = MethodType(NAGJointAttention.forward, module)
