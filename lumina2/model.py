@@ -89,8 +89,6 @@ class NAGNextDiT(NextDiT):
 
         # 6. Post-process Output
         if apply_nag and isinstance(output, torch.Tensor):
-            # Restore original batch size (discard the extra NAG guidance outputs)
-            # Previously this was hardcoded to split in half, which is wrong if we added 1 item to a batch of 2.
             output = output[:original_batch_size]
 
         return output
