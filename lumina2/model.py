@@ -62,6 +62,7 @@ class NAGNextDiT(NextDiT):
             # 3. Patch Modules safely
             for name, module in self.named_modules():
                 # Check for 'qkv' attribute to ensure we only patch actual Attention layers
+                # and strictly exclude the rope_embedder or other false positives.
                 if isinstance(module, JointAttention) and hasattr(module, "qkv"):
                     attention_forwards.append((module, module.forward))
                     module.forward = MethodType(NAGJointAttention.forward, module)
