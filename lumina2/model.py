@@ -1,7 +1,6 @@
 from functools import partial
 from types import MethodType
 import torch
-import torch.nn.functional as F
 import comfy.patcher_extension
 from comfy.ldm.lumina.model import NextDiT, JointAttention
 from ..utils import check_nag_activation, NAGSwitch, cat_context
@@ -23,10 +22,14 @@ class NAGNextDiT(NextDiT):
     ):
         transformer_options = kwargs.get("transformer_options", {})
         apply_nag = check_nag_activation(transformer_options, nag_sigma_end)
+        
+        # Capture original batch size for post-processing restoration
+        original_batch_size = x.shape[0]
 
         attention_forwards = list()
 
         if apply_nag:
+                        
             # 1. Calculate Image Token Count for the Attention layer to use
             _, _, h, w = x.shape
             p = self.patch_size
@@ -34,50 +37,27 @@ class NAGNextDiT(NextDiT):
             transformer_options["nag_img_token_len"] = img_token_len
 
             # 2. Prepare Inputs
-            # Double the image input
-            x = torch.cat([x, x], dim=0)
+            # Extend context (e.g., adds NAG negative, Batch 2 -> 3)
+            context = cat_context(context, nag_negative_context)
+            target_batch_size = context.shape[0]
+            
+            # Calculate how many items we need to add to x to match the new context size
+            needed_count = target_batch_size - original_batch_size
 
-            if timesteps is not None:
-                timesteps = torch.cat([timesteps, timesteps], dim=0)
-            if attention_mask is not None:
-                attention_mask = torch.cat([attention_mask, attention_mask], dim=0)
+            if needed_count > 0:
+                # We append the necessary amount of latents from the input to match the context.
+                # Usually we take the first 'needed_count' elements (often corresponding to unconditional/conditional inputs)
+                x_extra = x[:needed_count]
+                x = torch.cat([x, x_extra], dim=0)
 
-            # Handle Context Doubling manually
-            if isinstance(context, torch.Tensor):
-                # Create a copy for the second half (the NAG reference path)
-                nag_ctx_half = context.clone()
+                if timesteps is not None:
+                    t_extra = timesteps[:needed_count]
+                    timesteps = torch.cat([timesteps, t_extra], dim=0)
                 
-                if nag_negative_context is not None:
-                    # Ensure dimensions match for assignment
-                    if nag_negative_context.dim() == 2:
-                        nag_cond = nag_negative_context.unsqueeze(0)
-                    else:
-                        nag_cond = nag_negative_context
-                    
-                    # --- Fix: Resize NAG Context to match Main Context Length ---
-                    target_len = nag_ctx_half.shape[1]
-                    current_len = nag_cond.shape[1]
-
-                    if current_len != target_len:
-                        if current_len > target_len:
-                            # Crop if too long
-                            nag_cond = nag_cond[:, :target_len, :]
-                        else:
-                            # Pad with zeros if too short
-                            pad_amount = target_len - current_len
-                            # F.pad for 3D tensor [B, Seq, Dim]: (pad_last_dim_L, R, pad_seq_L, R)
-                            nag_cond = F.pad(nag_cond, (0, 0, 0, pad_amount))
-
-                    # Inject the negative context
-                    # ComfyUI batches are typically [Cond, Uncond].
-                    # We want the NAG batch to be [Cond, NAG_Uncond].
-                    if nag_ctx_half.shape[0] > 1:
-                        nag_ctx_half[1] = nag_cond[0]
-                    else:
-                        # Fallback for single batch
-                        nag_ctx_half[0] = nag_cond[0]
-
-                context = torch.cat([context, nag_ctx_half], dim=0)
+                if attention_mask is not None:
+                    # attention_mask might be 2D or 3D depending on implementation, slicing dim 0 is safe
+                    m_extra = attention_mask[:needed_count]
+                    attention_mask = torch.cat([attention_mask, m_extra], dim=0)
 
             # 3. Patch Modules safely
             for name, module in self.named_modules():
@@ -109,8 +89,9 @@ class NAGNextDiT(NextDiT):
 
         # 6. Post-process Output
         if apply_nag and isinstance(output, torch.Tensor):
-            # Take only the first half (guided positive)
-            output = output[:output.shape[0] // 2]
+            # Restore original batch size (discard the extra NAG guidance outputs)
+            # Previously this was hardcoded to split in half, which is wrong if we added 1 item to a batch of 2.
+            output = output[:original_batch_size]
 
         return output
 
