@@ -36,7 +36,7 @@ class NAGJointAttention(JointAttention):
 
         # Safety fallback: if NAG is not active or odd batch size, run standard
         if bsz % 2 != 0 or bsz < 2 or img_len == 0:
-            return super().forward(x, x_mask, freqs_cis, transformer_options)
+            return JointAttention.forward(self, x, x_mask, freqs_cis, transformer_options)
 
         origin_bsz = bsz // 2
 
