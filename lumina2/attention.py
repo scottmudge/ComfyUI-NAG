@@ -31,8 +31,12 @@ class NAGJointAttention(JointAttention):
 
         bsz, seqlen, _ = x.shape
 
-        # Retrieve image token length injected by NAGNextDiT
-        img_len = transformer_options.get("nag_img_token_len", 0)
+        # Retrieve image token length
+        # Priority 1: Direct injection from NAGNextDiT (fixes dictionary copy issues)
+        # Priority 2: Dictionary fallback
+        img_len = getattr(self, "nag_img_token_len", 0)
+        if img_len == 0:
+            img_len = transformer_options.get("nag_img_token_len", 0)
 
         # Safety fallback: if NAG is not active or odd batch size, run standard
         if bsz % 2 != 0 or bsz < 2 or img_len == 0:
