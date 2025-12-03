@@ -22,48 +22,35 @@ class NAGNextDiT(NextDiT):
     ):
         transformer_options = kwargs.get("transformer_options", {})
         apply_nag = check_nag_activation(transformer_options, nag_sigma_end)
-        
-        # Capture original batch size for post-processing restoration
-        original_batch_size = x.shape[0]
 
         attention_forwards = list()
 
         if apply_nag:
-                        
             # 1. Calculate Image Token Count for the Attention layer to use
             _, _, h, w = x.shape
             p = self.patch_size
             img_token_len = (h // p) * (w // p)
+            
+            # Fallback injection into options (just in case)
             transformer_options["nag_img_token_len"] = img_token_len
 
             # 2. Prepare Inputs
-            # Extend context (e.g., adds NAG negative, Batch 2 -> 3)
             context = cat_context(context, nag_negative_context)
-            target_batch_size = context.shape[0]
-            
-            # Calculate how many items we need to add to x to match the new context size
-            needed_count = target_batch_size - original_batch_size
+            x = torch.cat([x, x], dim=0)
 
-            if needed_count > 0:
-                # We append the necessary amount of latents from the input to match the context.
-                # Usually we take the first 'needed_count' elements (often corresponding to unconditional/conditional inputs)
-                x_extra = x[:needed_count]
-                x = torch.cat([x, x_extra], dim=0)
-
-                if timesteps is not None:
-                    t_extra = timesteps[:needed_count]
-                    timesteps = torch.cat([timesteps, t_extra], dim=0)
-                
-                if attention_mask is not None:
-                    # attention_mask might be 2D or 3D depending on implementation, slicing dim 0 is safe
-                    m_extra = attention_mask[:needed_count]
-                    attention_mask = torch.cat([attention_mask, m_extra], dim=0)
+            if timesteps is not None:
+                timesteps = torch.cat([timesteps, timesteps], dim=0)
+            if attention_mask is not None:
+                attention_mask = torch.cat([attention_mask, attention_mask], dim=0)
 
             # 3. Patch Modules safely
             for name, module in self.named_modules():
                 # Check for 'qkv' attribute to ensure we only patch actual Attention layers
-                # and strictly exclude the rope_embedder or other false positives.
                 if isinstance(module, JointAttention) and hasattr(module, "qkv"):
+                    # Inject token length directly into the module instance
+                    # This bypasses transformer_options propagation issues
+                    module.nag_img_token_len = img_token_len
+                    
                     attention_forwards.append((module, module.forward))
                     module.forward = MethodType(NAGJointAttention.forward, module)
 
@@ -79,18 +66,21 @@ class NAGNextDiT(NextDiT):
             ).execute(x, timesteps, context, num_tokens, attention_mask, **kwargs)
 
         finally:
-            # 5. Restore Original Methods (Always run this, even if crash happens)
+            # 5. Restore Original Methods and Cleanup
             if apply_nag:
                 for mod, forward_fn in attention_forwards:
                     mod.forward = forward_fn
+                    # Remove the injected attribute to leave no trace
+                    if hasattr(mod, "nag_img_token_len"):
+                        del mod.nag_img_token_len
 
-                # Cleanup
                 if "nag_img_token_len" in transformer_options:
                     del transformer_options["nag_img_token_len"]
 
         # 6. Post-process Output
         if apply_nag and isinstance(output, torch.Tensor):
-            output = output[:original_batch_size]
+            # Take only the first half (guided positive)
+            output = output[:output.shape[0] // 2]
 
         return output
 
@@ -110,7 +100,7 @@ class NAGNextDiTSwitch(NAGSwitch):
         # Store the negative context reference
         self._nag_negative_context = self.nag_negative_cond[0][0]
         
-        # Create a wrapper function instead of using partial to avoid capturing tensor refs
+        # Create a wrapper function
         def nag_forward_wrapper(model_self, *args, **kwargs):
             return NAGNextDiT.forward(
                 model_self,
