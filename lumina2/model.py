@@ -23,7 +23,7 @@ class NAGNextDiT(NextDiT):
         transformer_options = kwargs.get("transformer_options", {})
         apply_nag = check_nag_activation(transformer_options, nag_sigma_end)
 
-        attention_forwards = list()
+        modules_patched = list()
 
         if apply_nag:
             # 1. Calculate Image Token Count for the Attention layer to use
