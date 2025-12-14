@@ -2,9 +2,29 @@ import torch
 import comfy
 from comfy_extras.nodes_custom_sampler import Noise_EmptyNoise, Noise_RandomNoise
 import latent_preview
+import copy
+from types import MethodType
+from torch._dynamo.eval_frame import OptimizedModule
 
 from .samplers import NAGCFGGuider as samplers_NAGCFGGuider
 from .sample import sample_with_nag, sample_custom_with_nag
+from .flux.model import NAGFluxSwitch
+from .chroma.model import NAGChromaSwitch
+from .sd.openaimodel import NAGUNetModelSwitch
+from .sd3.mmdit import NAGOpenAISignatureMMDITWrapperSwitch
+from .wan.model import NAGWanModelSwitch
+from .hunyuan_video.model import NAGHunyuanVideoSwitch
+from .hidream.model import NAGHiDreamImageTransformer2DModelSwitch
+from .lumina2.model import NAGNextDiTSwitch
+
+from comfy.ldm.flux.model import Flux
+from comfy.ldm.chroma.model import Chroma
+from comfy.ldm.modules.diffusionmodules.openaimodel import UNetModel
+from comfy.ldm.modules.diffusionmodules.mmdit import OpenAISignatureMMDITWrapper
+from comfy.ldm.wan.model import WanModel, VaceWanModel
+from comfy.ldm.hunyuan_video.model import HunyuanVideo
+from comfy.ldm.hidream.model import HiDreamImageTransformer2DModel
+from comfy.ldm.lumina.model import NextDiT
 
 
 def common_ksampler_with_nag(model, seed, steps, cfg, nag_scale, nag_tau, nag_alpha, nag_sigma_end, sampler_name,
@@ -291,10 +311,198 @@ class SamplerCustomWithNAG:
         return (out, out_denoised)
 
 
+class ModelNAG:
+    """
+    Applies NAG to a model using the NAGSwitch approach (similar to guider/ksampler technique).
+    This patches the model's forward method to apply NAG during inference.
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "nag_negative": ("CONDITIONING", {
+                    "tooltip": "The conditioning describing the attributes you want to exclude from the image for NAG."}),
+                "nag_scale": ("FLOAT", {"default": 11.0, "min": 0.0, "max": 100.0, "step": 0.001, 
+                    "tooltip": "Strength of negative guidance effect"}),
+                "nag_alpha": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.001, 
+                    "tooltip": "Mixing coefficient that controls the balance between the normalized guided representation and the original positive representation."}),
+                "nag_tau": ("FLOAT", {"default": 2.5, "min": 0.0, "max": 10.0, "step": 0.001, 
+                    "tooltip": "Clipping threshold that controls how much the guided attention can deviate from the positive attention."}),
+                "nag_sigma_end": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 20.0, "step": 0.01, 
+                    "tooltip": "Sigma value at which NAG stops being applied. Set to 0.0 to apply NAG throughout the entire denoising process."}),
+            },
+        }
+    
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "patch"
+    CATEGORY = "KJNodes/experimental"
+    DESCRIPTION = "Applies Normalized Attention Guidance (NAG) to a model using the guider/ksampler technique. Works best for batch sizes up to 4. For larger or variable batch sizes, use NAGGuider or KSamplerWithNAG nodes. https://github.com/ChenDarYen/Normalized-Attention-Guidance"
+    EXPERIMENTAL = True
+
+    def patch(self, model, nag_negative, nag_scale, nag_alpha, nag_tau, nag_sigma_end):
+        if nag_scale == 0:
+            return (model,)
+        
+        # Clone the model to avoid modifying the original
+        model_clone = model.clone()
+        
+        # Get the diffusion model
+        diffusion_model = model_clone.model.diffusion_model
+        if isinstance(diffusion_model, OptimizedModule):
+            diffusion_model = diffusion_model._orig_mod
+        
+        # Determine model type and select appropriate NAGSwitch class
+        model_type = type(diffusion_model)
+        if model_type == Flux:
+            switcher_cls = NAGFluxSwitch
+        elif model_type == Chroma:
+            switcher_cls = NAGChromaSwitch
+        elif model_type == UNetModel:
+            switcher_cls = NAGUNetModelSwitch
+        elif model_type == OpenAISignatureMMDITWrapper:
+            switcher_cls = NAGOpenAISignatureMMDITWrapperSwitch
+        elif model_type in [WanModel, VaceWanModel]:
+            switcher_cls = NAGWanModelSwitch
+        elif model_type == HunyuanVideo:
+            switcher_cls = NAGHunyuanVideoSwitch
+        elif model_type == NextDiT:
+            switcher_cls = NAGNextDiTSwitch
+        elif model_type == HiDreamImageTransformer2DModel:
+            switcher_cls = NAGHiDreamImageTransformer2DModelSwitch
+        else:
+            raise ValueError(
+                f"Model type {model_type} is not supported for ModelNAG. "
+                f"Supported types: Flux, Chroma, UNetModel, OpenAISignatureMMDITWrapper, "
+                f"WanModel, VaceWanModel, HunyuanVideo, NextDiT, HiDreamImageTransformer2DModel"
+            )
+        
+        # Store original nag_negative for dynamic batch size expansion
+        # We don't expand it here - instead we'll expand it dynamically during forward pass
+        original_nag_negative = copy.deepcopy(nag_negative)
+        
+        # Store original forward before any patching
+        original_forward = diffusion_model.forward
+        
+        # Create a wrapper class that handles dynamic batch size expansion
+        class DynamicNAGSwitch(switcher_cls):
+            def __init__(self, model, original_nag_negative, nag_scale, nag_tau, nag_alpha, nag_sigma_end, original_forward, forward_wrapper):
+                # Store original for dynamic expansion
+                self._original_nag_negative = original_nag_negative
+                self._nag_scale = nag_scale
+                self._nag_tau = nag_tau
+                self._nag_alpha = nag_alpha
+                self._nag_sigma_end = nag_sigma_end
+                self._model = model
+                self._switcher = None
+                self._current_batch_size = None
+                self._original_forward = original_forward
+                self._forward_wrapper = forward_wrapper
+                
+            def _expand_nag_negative(self, batch_size):
+                """Expand nag_negative to match the given batch size"""
+                if self._current_batch_size == batch_size and self._switcher is not None:
+                    return  # Already expanded to correct size
+                
+                # Expand nag_negative to match batch size
+                nag_negative_expanded = copy.deepcopy(self._original_nag_negative)
+                nag_negative_expanded[0][0] = nag_negative_expanded[0][0].expand(batch_size, -1, -1)
+                if nag_negative_expanded[0][1].get("pooled_output", None) is not None:
+                    nag_negative_expanded[0][1]["pooled_output"] = nag_negative_expanded[0][1]["pooled_output"].expand(batch_size, -1)
+                
+                # If switcher exists, restore original forward first to clean up
+                if self._switcher is not None:
+                    # Temporarily restore original to clean up the old switcher's state
+                    # But first, save the current wrapper if it exists
+                    was_wrapped = hasattr(self._model, '_nag_wrapper_applied') and self._model._nag_wrapper_applied
+                    if was_wrapped:
+                        # Temporarily remove wrapper to get to the switcher's forward
+                        self._model.forward = self._model._nag_actual_forward
+                    self._switcher.set_origin()
+                    # Now forward should be original_forward
+                
+                # Create new switcher with expanded batch size
+                self._switcher = switcher_cls(
+                    self._model,
+                    nag_negative_expanded,
+                    self._nag_scale, self._nag_tau, self._nag_alpha, self._nag_sigma_end,
+                )
+                self._switcher.set_nag()
+                self._current_batch_size = batch_size
+                
+                # Store the switcher's forward BEFORE we wrap it
+                # This is the actual NAG-patched forward we want to call
+                switcher_forward = self._model.forward
+                self._model._nag_actual_forward = switcher_forward
+                
+                # Re-apply our wrapper as the outermost wrapper
+                if self._forward_wrapper is not None:
+                    self._model.forward = MethodType(self._forward_wrapper, self._model)
+                    self._model._nag_wrapper_applied = True
+            
+            def set_nag(self):
+                # Don't set nag here - we'll do it dynamically in the forward wrapper
+                pass
+            
+            def set_origin(self):
+                if self._switcher is not None:
+                    self._switcher.set_origin()
+                    self._model.forward = self._original_forward
+        
+        # Create dynamic switcher (forward_wrapper will be set after switcher is created)
+        dynamic_switcher = DynamicNAGSwitch(
+            diffusion_model,
+            original_nag_negative,
+            nag_scale, nag_tau, nag_alpha, nag_sigma_end,
+            original_forward,
+            None,  # Will be set below
+        )
+        
+        # Define forward wrapper function that uses the dynamic switcher
+        def nag_forward_wrapper(model_self, *args, **kwargs):
+            # Get context to determine batch size
+            context = None
+            if 'context' in kwargs:
+                context = kwargs['context']
+            elif len(args) >= 3:
+                # Context is typically the 3rd argument (after x, timestep)
+                context = args[2]
+            
+            # Determine batch size from context or x
+            batch_size = None
+            if context is not None and isinstance(context, torch.Tensor):
+                batch_size = context.shape[0]
+            elif len(args) > 0 and isinstance(args[0], torch.Tensor):
+                # Fallback to x batch size
+                batch_size = args[0].shape[0]
+            
+            # Expand nag_negative to match batch size if we have it
+            if batch_size is not None and batch_size > 0:
+                dynamic_switcher._expand_nag_negative(batch_size)
+            
+            # Call the actual forward method (stored by the switcher)
+            return model_self._nag_actual_forward(*args, **kwargs)
+        
+        # Set the forward wrapper in the switcher
+        dynamic_switcher._forward_wrapper = nag_forward_wrapper
+        
+        # Initialize with batch size 1 as default (will be expanded dynamically)
+        # This will create the switcher and patch the forward, then wrap it
+        dynamic_switcher._expand_nag_negative(1)
+        
+        # Store references
+        model_clone._nag_switcher = dynamic_switcher
+        model_clone._nag_original_forward = original_forward
+        
+        return (model_clone,)
+
+
 NODE_CLASS_MAPPINGS = {
     "NAGGuider": NAGGuider,
     "NAGCFGGuider": NAGCFGGuider,
     "KSamplerWithNAG": KSamplerWithNAG,
     "KSamplerWithNAG (Advanced)": KSamplerAdvancedWithNAG,
     "SamplerCustomWithNAG": SamplerCustomWithNAG,
+    "ModelNAG": ModelNAG,
 }
